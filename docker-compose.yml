@@ -1,0 +1,271 @@
+# DCM4CHEE with secured UI and secured RESTful services, plus OHIF running on SSL
+# Before starting this project, please do the following:
+# - set desired profiles and environment variables in .env
+# - set <docker_host> to correct hostname in relevant ./config/app-config-*.js
+# - define local timezone in ./config/etc/timezone
+# - run these commands in the docker-compose.yml directory before initialising project for the first time
+# - sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout ./config/self-signed-private.key -out ./config/self-signed.crt
+# - sudo chmod 644 ./config/self-signed.crt ./config/self-signed-private.key
+# - after keycloak has started - need to register OHIF as OIDC client
+#
+# Note: takes a while for keycloak to spin up the first boot, be patient.
+
+version: "3"
+services:
+  ldap:
+    profiles: ["dcm4chee-minimal","dcm4chee-secure","dcm4chee-secure-ui"]
+    image: dcm4che/slapd-dcm4chee:2.6.5-31.2
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+    ports:
+      - "389:389"
+      - "636:636"
+    environment:
+      STORAGE_DIR: /storage/fs1
+    volumes:
+      - ./data/dcm4chee-arc/ldap:/var/lib/openldap/openldap-data
+      - ./data/dcm4chee-arc/slapd.d:/etc/openldap/slapd.d
+    restart: unless-stopped
+    networks:
+      - pacs_network
+
+  mariadb:
+    profiles: ["dcm4chee-secure","dcm4chee-secure-ui"]
+    image: mariadb:10.11.4
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: secret
+      MYSQL_DATABASE: keycloak
+      MYSQL_USER: keycloak
+      MYSQL_PASSWORD: keycloak
+    volumes:
+      - ./config/etc/localtime:/etc/localtime:ro
+      - ./config/etc/timezone:/etc/timezone:ro
+      - ./data/dcm4chee-arc/mysql:/var/lib/mysql
+    networks:
+      - pacs_network
+
+  keycloak:
+    profiles: ["dcm4chee-secure","dcm4chee-secure-ui"]
+    image: dcm4che/keycloak:23.0.3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+    ports:
+      - "8843:8843"
+    environment:
+      KC_HTTPS_PORT: 8843
+      KC_HOSTNAME: ${DOCKER_HOSTNAME}
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: changeit
+      KC_DB: mariadb
+      KC_DB_URL_DATABASE: keycloak
+      KC_DB_URL_HOST: mariadb
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+      KC_LOG: file
+      ARCHIVE_HOST: ${DOCKER_HOSTNAME}
+      KEYCLOAK_WAIT_FOR: ldap:389 mariadb:3306
+    depends_on:
+      - ldap
+      - mariadb
+    volumes:
+      - ./config/etc/localtime:/etc/localtime:ro
+      - ./config/etc/timezone:/etc/timezone:ro
+      - ./data/dcm4chee-arc/keycloak:/opt/keycloak/data
+    networks:
+      - pacs_network
+
+  db:
+    profiles: ["dcm4chee-minimal","dcm4chee-secure","dcm4chee-secure-ui"]
+    image: dcm4che/postgres-dcm4chee:15.4-31
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: pacsdb
+      POSTGRES_USER: pacs
+      POSTGRES_PASSWORD: pacs
+    volumes:
+      - ./config/etc/localtime:/etc/localtime:ro
+      - ./config/etc/timezone:/etc/timezone:ro
+      - ./data/dcm4chee-arc/db:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - pacs_network
+
+  arc-secure-ui:
+    profiles: ["dcm4chee-secure-ui"]
+    image: dcm4che/dcm4chee-arc-psql:5.31.2-secure-ui
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+      - "9990:9990"
+      - "9993:9993"
+      - "11112:11112"
+      - "2762:2762"
+      - "2575:2575"
+      - "12575:12575"
+    environment:
+      POSTGRES_DB: pacsdb
+      POSTGRES_USER: pacs
+      POSTGRES_PASSWORD: pacs
+      AUTH_SERVER_URL: https://keycloak:8843
+      UI_AUTH_SERVER_URL: https://${DOCKER_HOSTNAME}:8843
+      WILDFLY_CHOWN: /storage
+      WILDFLY_WAIT_FOR: ldap:389 db:5432 keycloak:8843
+    depends_on:
+      - ldap
+      - keycloak
+      - db
+    volumes:
+      - ./config/etc/localtime:/etc/localtime:ro
+      - ./config/etc/timezone:/etc/timezone:ro
+      - ./data/dcm4chee-arc/wildfly:/opt/wildfly/standalone
+      - ./data/dcm4chee-arc/storage:/storage
+    restart: unless-stopped
+    networks:
+      - pacs_network
+
+  arc-secure:
+    profiles: ["dcm4chee-secure"]
+    image: dcm4che/dcm4chee-arc-psql:5.31.2-secure
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+      - "9990:9990"
+      - "9993:9993"
+      - "11112:11112"
+      - "2762:2762"
+      - "2575:2575"
+      - "12575:12575"
+    environment:
+      POSTGRES_DB: pacsdb
+      POSTGRES_USER: pacs
+      POSTGRES_PASSWORD: pacs
+      AUTH_SERVER_URL: https://keycloak:8843
+      UI_AUTH_SERVER_URL: https://${DOCKER_HOSTNAME}:8843
+      WILDFLY_CHOWN: /storage
+      WILDFLY_WAIT_FOR: ldap:389 db:5432 keycloak:8843
+    depends_on:
+      - ldap
+      - keycloak
+      - db
+    volumes:
+      - ./config/etc/localtime:/etc/localtime:ro
+      - ./config/etc/timezone:/etc/timezone:ro
+      - ./data/dcm4chee-arc/wildfly:/opt/wildfly/standalone
+      - ./data/dcm4chee-arc/storage:/storage
+    restart: unless-stopped
+    networks:
+      - pacs_network
+
+  arc-minimal:
+    profiles: ["dcm4chee-minimal"]
+    image: dcm4che/dcm4chee-arc-psql:5.31.2
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+      - "9990:9990"
+      - "9993:9993"
+      - "11112:11112"
+      - "2762:2762"
+      - "2575:2575"
+      - "12575:12575"
+    environment:
+      POSTGRES_DB: pacsdb
+      POSTGRES_USER: pacs
+      POSTGRES_PASSWORD: pacs
+      WILDFLY_CHOWN: /storage
+      WILDFLY_WAIT_FOR: ldap:389 db:5432
+    depends_on:
+      - ldap
+      - db
+    volumes:
+      - ./config/etc/localtime:/etc/localtime:ro
+      - ./config/etc/timezone:/etc/timezone:ro
+      - ./data/dcm4chee-arc/wildfly:/opt/wildfly/standalone
+      - ./data/dcm4chee-arc/storage:/storage
+    restart: unless-stopped
+    networks:
+      - pacs_network
+
+  orthanc:
+    profiles: ["orthanc"]
+    image: jodogne/orthanc-plugins
+    hostname: orthanc
+    ports:
+      - "8042:8042"
+      - "4242:4242"
+    container_name: orthanc
+    volumes:
+      - ./config/orthanc.json:/etc/orthanc/orthanc.json:ro
+      - ./data/orthanc-db/:/var/lib/orthanc/db/
+    restart: unless-stopped
+    networks:
+      - pacs_network
+
+  ohif_viewer_ssl:
+    profiles: ["ohif-ssl"]
+    environment:
+      SSL_PORT: 443
+    ports:
+      - "3003:443"
+    image: ohif/app:${OHIF_IMAGE_TAG:?}
+    volumes:
+      - ${OHIF_CONFIG_PATH}:/usr/share/nginx/html/app-config.js
+      - ./config/self-signed.crt:/etc/ssl/certs/ssl-certificate.crt
+      - ./config/self-signed-private.key:/etc/ssl/private/ssl-private-key.key
+    restart: unless-stopped
+    networks:
+      - pacs_network
+
+  ohif_viewer:
+    profiles: ["ohif-no-ssl"]
+    ports:
+      - "3000:80"
+    image: ohif/app:${OHIF_IMAGE_TAG:?}
+    volumes:
+      - ${OHIF_CONFIG_PATH}:/usr/share/nginx/html/app-config.js
+    restart: unless-stopped
+    networks:
+      - pacs_network
+
+  dozzle:
+    profiles: ["dozzle"]
+    container_name: dozzle
+    image: amir20/dozzle:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - 9999:8080
+    networks:
+      - pacs_network
+
+networks:
+  pacs_network:
+    name: pacs_network
+    driver: bridge
