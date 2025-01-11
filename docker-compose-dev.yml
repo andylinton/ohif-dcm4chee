@@ -1,0 +1,250 @@
+## see README.md for initial steps
+
+networks:
+  frontend:
+    name: frontend
+  pacs_backend:
+    name: pacs_backend
+
+volumes:
+  # useful for storing images on a NAS. Alternatively, set directory in .env and arc container
+  nfs-data-volume:
+    driver_opts:
+      type: "nfs"
+      o: "addr=<nas_ip_address>,rw,nolock,soft"
+      device: ":</path/to/nas/storage>"
+
+secrets:
+  basic_auth_credentials:
+    file: ./secrets/basic_auth_credentials
+  dreamhost_api_key:
+    file: ./secrets/dreamhost_api_key
+
+services:
+  traefik:
+    container_name: traefik
+    image: traefik:v3.2
+    ports:
+      - 80:80
+      - 443:443
+    command:
+      - --global.checkNewVersion=false
+      - --global.sendAnonymousUsage=false
+      - --log.level=${TRAEFIK_LOG_LEVEL}
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=frontend
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.web.http.redirections.entrypoint.permanent=true
+      - --entrypoints.websecure.address=:443
+      - --entryPoints.websecure.forwardedHeaders.trustedIPs=127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      - --entrypoints.websecure.http.tls=true
+      - --entrypoints.websecure.http.tls.certresolver=letsencrypt
+      - --entrypoints.websecure.http.tls.domains[0].main=${DOCKER_HOSTNAME}
+      - --entrypoints.websecure.http.tls.domains[0].sans=*.${DOCKER_HOSTNAME}
+      - --api
+      - --certificatesresolvers.letsencrypt.acme.email=${DNS_PROVIDER_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.dnschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.dnschallenge.provider=${DNS_PROVIDER_NAME}
+      - --certificatesresolvers.letsencrypt.acme.dnschallenge.delaybeforecheck=0
+      - --certificatesresolvers.letsencrypt.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53
+      # !IMPORTANT - COMMENT OUT THE FOLLOWING LINE IN PRODUCTION!
+      # - --certificatesresolvers.letsencrypt.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
+    labels:
+      - traefik.enable=${TRAEFIK_ENABLE_DASHBOARD}
+      - traefik.http.routers.traefik-dashboard.entrypoints=websecure
+      - traefik.http.routers.traefik-dashboard.rule=Host(`${TRAEFIK_SUBDOMAIN}.${DOCKER_HOSTNAME}`)
+      - traefik.http.routers.traefik-dashboard.service=api@internal
+      - traefik.http.routers.traefik-dashboard.middlewares=basic-auth
+      - traefik.http.middlewares.basic-auth.basicauth.usersFile=/run/secrets/basic_auth_credentials
+    environment:
+      DREAMHOST_API_KEY_FILE: /run/secrets/dreamhost_api_key
+    secrets:
+      - basic_auth_credentials
+      - dreamhost_api_key
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./data/traefik/letsencrypt:/letsencrypt
+    restart: always
+    networks:
+      - frontend
+
+  ldap:
+    container_name: ldap
+    image: dcm4che/slapd-dcm4chee:2.6.5-31.2
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+    environment:
+      STORAGE_DIR: /storage/fs1
+    volumes:
+      - ./data/dcm4chee-arc/ldap:/var/lib/openldap/openldap-data
+      - ./data/dcm4chee-arc/slapd.d:/etc/openldap/slapd.d
+    restart: always
+    networks:
+      - pacs_backend
+
+  db:
+    container_name: db
+    image: dcm4che/postgres-dcm4chee:15.4-31
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+    environment:
+      POSTGRES_DB: pacsdb
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./data/dcm4chee-arc/db:/var/lib/postgresql/data
+    restart: always
+    networks:
+      - pacs_backend
+
+  mariadb:
+    container_name: mariadb
+    image: mariadb:10.11.4
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: keycloak
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./data/dcm4chee-arc/mysql:/var/lib/mysql
+    restart: always
+    networks:
+      - pacs_backend
+
+  keycloak:
+    container_name: keycloak
+    image: dcm4che/keycloak:23.0.3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.keycloak.rule=Host(`${KEYCLOAK_SUBDOMAIN}.${DOCKER_HOSTNAME}`)
+      - traefik.http.routers.keycloak.entrypoints=websecure
+      - traefik.http.services.keycloak.loadbalancer.server.port=8080
+    environment:
+      KC_HTTPS_PORT: 8843 # internal port
+      # KC_HOSTNAME: <keycloak-subdomain.example.com>  # do not set if keycloak is behind reverse proxy
+      KC_HOSTNAME_URL: https://${KEYCLOAK_SUBDOMAIN}.${DOCKER_HOSTNAME} # requires this setting instead of KC_HOSTNAME when behind proxy
+      KC_HOSTNAME_ADMIN_URL: https://${KEYCLOAK_SUBDOMAIN}.${DOCKER_HOSTNAME} # requires this setting instead of KC_HOSTNAME when behind proxy
+      KC_HOSTNAME_PORT: 443 # port used by reverse proxy, ie 443
+      KC_HTTP_ENABLED: true # trusted internal network, KC_PROXY set to edge. If passthrough, keycloak needs own certificate and disable HTTP
+      KC_HTTP_PORT: 8080 # internal port
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_PROXY: edge # documentation says use passthrough, but I prefer to terminate SSL at traefik and use http here
+      KC_DB: mariadb
+      KC_DB_URL_DATABASE: keycloak
+      KC_DB_URL_HOST: mariadb
+      KC_DB_USERNAME: ${KC_DB_USERNAME}
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD}
+      KC_LOG: file
+      ARCHIVE_HOST: ${ARC_SUBDOMAIN}.${DOCKER_HOSTNAME}
+      # have to adjust these ports after the first boot in keycloak client (delete port information from URLS as reverse proxy is handling archive directly)
+      ARCHIVE_HTTP_PORT: 80 # but need to remove this from dcm4chee-ui and dcm4chee-rs clients in keycloak after first boot
+      ARCHIVE_HTTPS_PORT: 443 # but need to remove this from dcm4chee-ui and dcm4chee-rs clients in keycloak after first boot
+      # ARCHIVE_MANAGEMENT_HTTPS_PORT: # currently not using reverse proxy for the wildfly admin console
+      KEYCLOAK_WAIT_FOR: ldap:389 mariadb:3306
+    depends_on:
+      - ldap
+      - mariadb
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./data/dcm4chee-arc/keycloak:/opt/keycloak/data
+    restart: always
+    networks:
+      - frontend
+      - pacs_backend
+
+  arc:
+    container_name: arc
+    image: dcm4che/dcm4chee-arc-psql:5.31.2-secure
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+    ports:
+      - "8080:8080" # required, even though behind reverse proxy
+      - "8443:8443" # required, even though behind reverse proxy
+      - "9990:9990"
+      - "9993:9993"
+      - "11112:11112"
+      - "2762:2762"
+      - "2575:2575"
+      - "12575:12575"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.arc.rule=Host(`${ARC_SUBDOMAIN}.${DOCKER_HOSTNAME}`)
+      - traefik.http.routers.arc.entrypoints=websecure
+      - traefik.http.services.arc.loadbalancer.server.port=8080
+    environment:
+      POSTGRES_DB: pacsdb
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      AUTH_SERVER_URL: https://${KEYCLOAK_SUBDOMAIN}.${DOCKER_HOSTNAME} # changed from http://keycloak:8843
+      UI_AUTH_SERVER_URL: https://${KEYCLOAK_SUBDOMAIN}.${DOCKER_HOSTNAME} # removed :8843 as now behind proxy
+      WILDFLY_CHOWN: /storage
+      WILDFLY_WAIT_FOR: ldap:389 db:5432 keycloak:8843
+    depends_on:
+      - ldap
+      - db
+      - keycloak
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./data/dcm4chee-arc/wildfly:/opt/wildfly/standalone
+      # if using NFS
+      - nfs-data-volume:/storage
+      # if using local folder
+      # - ${DICOM_STORAGE_DIR}:/storage
+    restart: always
+    networks:
+      - frontend
+      - pacs_backend
+
+  ohif:
+    container_name: ohif
+    image: ohif/app:v3.10.0-beta.54
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.ohif.rule=Host(`${OHIF_SUBDOMAIN}.${DOCKER_HOSTNAME}`)
+      - traefik.http.routers.ohif.entrypoints=websecure
+      - traefik.http.services.ohif.loadbalancer.server.port=80
+    volumes:
+      - ./config/app-config.js:/usr/share/nginx/html/app-config.js
+    restart: always
+    networks:
+      - frontend
+
+  dozzle:
+    container_name: dozzle
+    image: amir20/dozzle:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.dozzle.rule=Host(`${DOZZLE_SUBDOMAIN}.${DOCKER_HOSTNAME}`)
+      - traefik.http.routers.dozzle.entrypoints=websecure
+      - traefik.http.routers.dozzle.middlewares=basic-auth
+      - traefik.http.services.dozzle.loadbalancer.server.port=8080
+    restart: always
+    networks:
+      - frontend
