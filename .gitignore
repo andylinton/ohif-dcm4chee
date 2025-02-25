@@ -1,6 +1,5 @@
-./.env
-./docker-compose.yml
-./data
-./data/*
-./secrets/*
-./config/app-config.js
+.env
+docker-compose.yml
+data/
+secrets/*
+config/app-config.js
